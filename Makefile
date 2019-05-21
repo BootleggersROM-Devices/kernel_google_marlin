@@ -390,6 +390,12 @@ KBUILD_CFLAGS   := -Werror -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 		   -Wno-format-security \
 		   -std=gnu89
 
+ifeq ($(cc-name),clang)
+KBUILD_CFLAGS   += -mcpu=kryo
+else
+KBUILD_CFLAGS   += -mcpu=cortex-a57.cortex-a53
+endif
+
 KBUILD_AFLAGS_KERNEL :=
 KBUILD_CFLAGS_KERNEL :=
 KBUILD_AFLAGS   := -D__ASSEMBLY__
