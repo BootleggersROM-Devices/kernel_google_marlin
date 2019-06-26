@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+#
+# SPDX-License-Identifier: GPL-2.0 */
+#
+# Copyright (C) 2019 shagbag913 <sh4gbag913@gmail.com>. All Rights Reserved.
+#
+
+# Kernel source directory
+TOP=$(cd $(dirname ${BASH_SOURCE:-$0})/../ && pwd)
+
+# Common files/directories
+FLASHER=$TOP/flasher
+OUT=$TOP/out
+BUILDNUMFILE=$TOP/.build-number
+
+# Target kernel defconfig
+DEFCONFIG=marlin_defconfig
+
+# Kernel architecture
+ARCH=arm64
+
+# Toolchain to use to build kernel, note that GCC will still be
+# necessary if building with Clang (due to clang needing binutils)
+TOOLCHAIN=GCC
+
+# Amount of jobs to give make (1.75x CPU threads)
+JOBS=$(echo "$(nproc --all) * 1.75" | bc -l | sed -n 's/\..*//p')
+
+# Default make command
+MAKE="make -j$JOBS --no-print-directory -C $TOP O=$OUT ARCH=$ARCH"
+
+# Colors
+COL_CYAN='\e[36m'
+COL_DEF='\e[39m'
+
+# Optimized grep for Kconfigs
+alias kgrep='find . -type f -name "Kconfig*" ! -path "./out/*" ! -path "./git/*" -print0 | xargs -0 -P 4 grep -n'
+
+# Print a banner
+info() {
+    echo -e "$COL_CYAN##$(for i in $(seq ${#1}); do echo -e "#\c"; done)##"
+    echo "# $1 #"
+    echo -e "$COL_CYAN##$(for i in $(seq ${#1}); do echo -e "#\c"; done)##$COL_DEF"
+
+    # Add a small delay so it's easier to read
+    sleep .5
+}
+
+# Greps for a config
+cgrep() {
+    # strip CONFIG if it's included
+    config=$(echo $1 | sed 's/^CONFIG_//; s/=.*//')
+
+    kgrep "config $config"
+}
+
+# Greps for selection of config
+selgrep() {
+    # strip CONFIG if it's included
+    config=$(echo $1 | sed 's/^CONFIG_//; s/=.*//')
+
+    kgrep "select $config"
+}
+
+# Greps for dependency of config
+depgrep() {
+    # strip CONFIG if it's included
+    config=$(echo $1 | sed 's/^CONFIG_//; s/=.*//')
+
+    kgrep "depends on $config"
+}
+
+# Print a banner, then kill the build
+die() {
+    info "$1"
+    kill -INT $$
+}
+
+# Sets multiple date formats
+set-dates() {
+    DATEEPOCH=$(date +%s)
+    DATEZIP=$(date -d @$DATEEPOCH +%m%d%H%M)
+    DATENORM=$(date -d @$DATEEPOCH | sed 's/  / /')
+}
+
+# Handle build number
+build-number() {
+    BUILDNUM=$(($(test -f $BUILDNUMFILE && cat $BUILDNUMFILE) + 1))
+    echo $BUILDNUM > $BUILDNUMFILE
+}
+
+kernelversion() {
+    local kernelversion
+    local count
+    for i in VERSION PATCHLEVEL SUBLEVEL EXTRAVERSION; do
+        kernelversion+=$(sed -n "s/^$i = //p" <(cat $TOP/Makefile))
+        count=$((count+1))
+        if [[ $count -le 2 ]]; then
+            kernelversion+="."
+        fi
+    done
+    echo $kernelversion
+}
+
+# Create kernel banner
+banner() {
+    set-dates
+    echo "-> kernel version: $(kernelversion)"
+    echo "-> build date: $DATENORM"
+    echo "-> build number: $BUILDNUM"
+}
+
+# Checks if Telegram messaging is supported
+tg-supported() {
+    if [[ -n $NOTGUPLOAD || -z $TGBOTTOKEN || -z $TGCHATID ]]; then
+        info "Telegram messaging not supported."
+        return 1
+    fi
+}
+
+# Uploads input text to del.dog and outputs a link
+deldog() {
+    local result=$(curl -sf --data-binary "$1" https://del.dog/documents) || \
+        die "Failed to post document."
+    local key=$(jq -r .key <<< "$result")
+    echo "https://del.dog/$key"
+}
+
+# Clean flasher and generated objects from kernel build
+cleanup() {
+    for i in $FLASHER/{Image.lz4-dtb,banner} $(find $FLASHER -name '*.zip') $OUT; do
+        if [[ -e $i && -z $showed_msg ]]; then
+            info "Cleaning remnants from previous kernel builds"
+            local showed_msg=true
+        fi
+        rm -rfv $i
+    done
+
+    unset showed_msg
+
+    # Unset some global variables
+    unset OLDBUILDDATE DATENORM DATEZIP DATEEPOCH BUILDNUM
+}
+
+# Generates list of commits different from last build
+changelog() {
+    cd $TOP
+    [[ -n "$OLDBUILDDATE" ]] && git log --oneline --after="$OLDBUILDDATE"
+    cd - &>/dev/null
+}
+
+# Returns file size in kilobytes
+size-kb() {
+    du -BK $1 | awk '{print $1}'
+}
+
+# Generate kernel configuration file
+defconfig() {
+    info "Generating kernel configuration"
+    if ! $(echo "$MAKE") $DEFCONFIG; then
+        info "Failed to generate kernel configuration."
+        return 1
+    fi
+}
+
+# Build kernel
+build-kernel() {
+    set-dates
+
+    info "Building kernel"
+
+    if [[ -n $USE_CCACHE ]]; then
+        local ccache="ccache "
+    fi
+    if [[ $TOOLCHAIN = Clang ]]; then
+        if ! $(echo "$MAKE") CLANG_TRIPLE=$CLANG_TRIPLE CC="$ccache$CLANG" \
+                 CROSS_COMPILE=$CROSS_COMPILE \
+                 CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32; then
+            info "Failed to build the kernel image."
+            return 1
+        fi
+    else
+        if ! $(echo "$MAKE") CROSS_COMPILE="$ccache$CROSS_COMPILE" \
+                CROSS_COMPILE_ARM32="$ccache$CROSS_COMPILE_ARM32"; then
+            info "Failed to build the kernel image."
+            return 1
+        fi
+    fi
+
+    # Output build date
+    OLDBUILDDATE="$(cat $TOP/.build-date)"
+    echo "$DATENORM" > $TOP/.build-date
+}
+
+# Ensure the following enviroment variables are set before doing anything
+check-vars() {
+    unset notset
+    for cc in CROSS_COMPILE CROSS_COMPILE_ARM32; do
+        eval tmp="\${$cc}"
+        if [[ -z $tmp ]]; then
+            info "$cc is not set"
+            local notset=true
+        fi
+    done
+    if [[ $TOOLCHAIN = Clang ]]; then
+        for clang in CLANG CLANG_TRIPLE; do
+            eval tmp="\${$clang}"
+            if [[ -z $tmp ]]; then
+                info "$TOOLCHAIN is being used, but $clang is not set"
+                local notset=true
+            fi
+        done
+    fi
+    [[ -n $notset ]] && return 1 || return 0
+}
+
+# ZIP up the kernel into a flashable zip
+flasher() {
+    build-number
+    set-dates
+
+    KERNEL_NAME="kernel-$DATEZIP-bn$BUILDNUM.zip"
+
+    info "Zipping up the kernel"
+    banner > $FLASHER/banner
+    if ! cp -v $OUT/arch/$ARCH/boot/Image.lz4-dtb $FLASHER; then
+        info "Failed to copy kernel image."
+        return 1
+    elif ! cd $FLASHER; then
+        info "Failed to enter flasher directory."
+        return 1
+    elif ! zip -r9 $KERNEL_NAME *; then
+        info "Failed to zip AnyKernel2 zip."
+        return 1
+    fi
+    cd - &>/dev/null
+
+    info "Kernel zip: $FLASHER/$KERNEL_NAME"
+}
+
+# Uploads file to Telegram
+# tg-upload-file FILE CAPTION
+tg-upload-file() {
+    local url="https://api.telegram.org/bot$TGBOTTOKEN/sendDocument"
+
+    if tg-supported; then
+            curl -F chat_id=$TGCHATID -F document=@"$1" -F caption="$2" -F \
+                    parse_mode="Markdown" $url &>/dev/null
+    fi
+}
+
+# Generates minimal defconfig than saves it to $DEFCONFIG.
+savedefconfig() {
+    $(echo "$MAKE") savedefconfig
+    mv $OUT/defconfig $TOP/arch/$ARCH/configs/$DEFCONFIG
+    info "Minimal defconfig saved to $TOP/arch/$ARCH/configs/$DEFCONFIG."
+}
+
+
+# Perform everything in order to have a kernel zip
+build-all() {
+    for f in check-vars cleanup defconfig build-kernel flasher; do
+        if ! $f; then
+            die "$f failed. Aborting!"
+        fi
+    done
+
+    # Upload kernel zip to Telegram with a changelog
+    if tg-supported; then
+        local changelog="$(changelog)"
+        local deldogchangelog=$(deldog "$changelog")
+        local size=$(size-kb $FLASHER/$KERNEL_NAME)
+        local msg="$(echo -n "- #kernel\n- size: \`$size\`")"
+        [[ -n "$changelog" ]] && msg+="\n- [changelog]($deldogchangelog)"
+
+        # Add a diff if we have unstaged changes
+        if git status | grep 'Changes not staged for commit' &>/dev/null; then
+            local deldogdiff="$(pushd $TOP &>/dev/null; deldog "$(git diff)"; popd &>/dev/null)"
+            msg+="\n- [diff]($deldogdiff)"
+        fi
+
+        tg-upload-file $FLASHER/$KERNEL_NAME "$(echo -e "$msg")"
+    fi
+}

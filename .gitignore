@@ -100,3 +100,8 @@ all.config
 
 # Kernel objects
 out/
+
+# Flasher
+flasher/*.zip
+flasher/*Image*
+flasher/banner
