@@ -50,7 +50,7 @@
 
 
 static int restart_mode;
-static void *restart_reason, *dload_type_addr;
+static void *restart_reason;
 static bool scm_pmic_arbiter_disable_supported;
 static bool scm_deassert_ps_hold_supported;
 /* Download mode master kill-switch */
@@ -58,24 +58,9 @@ static void __iomem *msm_ps_hold;
 static phys_addr_t tcsr_boot_misc_detect;
 static void scm_disable_sdi(void);
 
-/* Runtime could be only changed value once.
- * There is no API from TZ to re-enable the registers.
- * So the SDI cannot be re-enabled when it already by-passed.
-*/
-static int download_mode = 1;
-static struct kobject dload_kobj;
-
-#ifdef CONFIG_MSM_DLOAD_MODE
-#define EDL_MODE_PROP "qcom,msm-imem-emergency_download_mode"
-#define DL_MODE_PROP "qcom,msm-imem-download_mode"
-
+static int is_warm_reset = 0;
 static int in_panic;
-static void *dload_mode_addr;
-static bool dload_mode_enabled;
-static void *emergency_dload_mode_addr;
-static bool scm_dload_supported;
 
-static int dload_set(const char *val, struct kernel_param *kp);
 /* interface for exporting attributes */
 struct reset_attribute {
 	struct attribute        attr;
@@ -90,21 +75,26 @@ struct reset_attribute {
 	static struct reset_attribute reset_attr_##_name = \
 			__ATTR(_name, _mode, _show, _store)
 
+#ifdef CONFIG_MSM_DLOAD_MODE
+#define EDL_MODE_PROP "qcom,msm-imem-emergency_download_mode"
+#define DL_MODE_PROP "qcom,msm-imem-download_mode"
+
+/* Runtime could be only changed value once.
+ * There is no API from TZ to re-enable the registers.
+ * So the SDI cannot be re-enabled when it already by-passed.
+*/
+static int download_mode = 1;
+static void *dload_mode_addr;
+static bool dload_mode_enabled;
+static void *emergency_dload_mode_addr;
+static bool scm_dload_supported;
+static void *dload_type_addr;
+static struct kobject dload_kobj;
+
+static int dload_set(const char *val, struct kernel_param *kp);
+
 module_param_call(download_mode, dload_set, param_get_int,
 			&download_mode, 0644);
-
-static int panic_prep_restart(struct notifier_block *this,
-			      unsigned long event, void *ptr)
-{
-	in_panic = 1;
-	return NOTIFY_DONE;
-}
-
-static struct notifier_block panic_blk = {
-	.notifier_call	= panic_prep_restart,
-};
-
-static int is_warm_reset = 0;
 
 int scm_set_dload_mode(int arg1, int arg2)
 {
@@ -152,7 +142,6 @@ static bool get_dload_mode(void)
 	return dload_mode_enabled;
 }
 
-#if 0
 static void enable_emergency_dload_mode(void)
 {
 	int ret;
@@ -177,7 +166,6 @@ static void enable_emergency_dload_mode(void)
 	if (ret)
 		pr_err("Failed to set secure EDLOAD mode: %d\n", ret);
 }
-#endif
 
 static int dload_set(const char *val, struct kernel_param *kp)
 {
@@ -215,6 +203,17 @@ static bool get_dload_mode(void)
 	return false;
 }
 #endif
+
+static int panic_prep_restart(struct notifier_block *this,
+			      unsigned long event, void *ptr)
+{
+	in_panic = 1;
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block panic_blk = {
+	.notifier_call	= panic_prep_restart,
+};
 
 static void scm_disable_sdi(void)
 {
@@ -391,10 +390,8 @@ static void msm_restart_prepare(const char *cmd)
 			unsigned long code;
 			code = simple_strtoul(cmd + 4, NULL, 16) & 0xff;
 			set_restart_to_oem(code, NULL);
-#if 0
 		} else if (!strncmp(cmd, "edl", 3)) {
 			enable_emergency_dload_mode();
-#endif
 		} else if (!strncmp(cmd, "download", 8 )) {
 			set_restart_action(0x6f656d00 | 0xe0, NULL);
 		} else if (!strncmp(cmd, "ftm", 3)) {
@@ -508,10 +505,7 @@ static const struct sysfs_ops reset_sysfs_ops = {
 	.store	= attr_store,
 };
 
-static struct kobj_type reset_ktype = {
-	.sysfs_ops	= &reset_sysfs_ops,
-};
-
+#ifdef CONFIG_MSM_DLOAD_MODE
 static ssize_t show_emmc_dload(struct kobject *kobj, struct attribute *attr,
 				char *buf)
 {
@@ -548,6 +542,10 @@ static size_t store_emmc_dload(struct kobject *kobj, struct attribute *attr,
 }
 RESET_ATTR(emmc_dload, 0644, show_emmc_dload, store_emmc_dload);
 
+static struct kobj_type reset_ktype = {
+	.sysfs_ops	= &reset_sysfs_ops,
+};
+
 static struct attribute *reset_attrs[] = {
 	&reset_attr_emmc_dload.attr,
 	NULL
@@ -556,6 +554,7 @@ static struct attribute *reset_attrs[] = {
 static struct attribute_group reset_attr_group = {
 	.attrs = reset_attrs,
 };
+#endif /* CONFIG_MSM_DLOAD_MODE */
 
 static int msm_restart_probe(struct platform_device *pdev)
 {
@@ -653,9 +652,11 @@ skip_sysfs_create:
 	if (scm_is_call_available(SCM_SVC_PWR, SCM_IO_DEASSERT_PS_HOLD) > 0)
 		scm_deassert_ps_hold_supported = true;
 
+#ifdef CONFIG_MSM_DLOAD_MODE
 	set_dload_mode(download_mode);
 	if (!download_mode)
 		scm_disable_sdi();
+#endif
 
 	return 0;
 
